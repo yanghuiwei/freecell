@@ -33,8 +33,10 @@ pub const HEADER_LABEL_PAD: f32 = 6.0;
 pub const SCROLLBAR_INSET: f32 = 3.0;
 /// Scrollbar thumb thickness (px).
 pub const SCROLLBAR_THICKNESS: f32 = 8.0;
-/// Minimum scrollbar thumb length (px) so a thumb over a huge extent stays grabbable.
-pub const SCROLLBAR_MIN_LEN: f32 = 24.0;
+/// Minimum scrollbar thumb length (px) so a thumb over a huge extent stays grabbable. Sized to
+/// stay comfortable on a mouse: on a full-size sheet the proportional length collapses to a few
+/// pixels, and anything under ~30 px is a hard target to catch and drag.
+pub const SCROLLBAR_MIN_LEN: f32 = 32.0;
 
 /// The scrollable content area (px), i.e. the viewport minus the fixed header strip. Never
 /// negative (a viewport smaller than the headers yields a zero-sized content area).
@@ -119,6 +121,111 @@ pub fn scrollbar_thumb(total: f64, content: f64, scroll: f64, track_len: f32) ->
     };
     let offset = (track_len - length) * fraction;
     Some(Thumb { offset, length })
+}
+
+/// A scrollbar laid out in the grid's coordinate space: the draggable **track** and the thumb
+/// inside it.
+///
+/// The track is wider than the drawn [`SCROLLBAR_THICKNESS`] thumb (see [`SCROLLBAR_HIT_W`]) so a
+/// pointer at the very edge of the window still grabs the bar, even though the visible thumb is
+/// inset by [`SCROLLBAR_INSET`]. Angles are in grid-local px.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollBar {
+    /// Start of the track along its axis (px from the grid edge).
+    pub track_start: f32,
+    /// Track length (px) — the body extent along the axis.
+    pub track_len: f32,
+    /// Position of the pointer band on the cross axis: its start (px) and width (px). A vertical
+    /// bar's band runs along x; a horizontal bar's along y.
+    pub band_start: f32,
+    pub band_len: f32,
+    pub thumb: Thumb,
+}
+
+/// Which axis a scrollbar runs along.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollAxis {
+    Vertical,
+    Horizontal,
+}
+
+/// Width (px) of the pointer band that reveals and grabs a scrollbar.
+pub const SCROLLBAR_HIT_W: f32 = 14.0;
+
+/// The vertical scrollbar for `pane`, or `None` when the non-frozen rows fit. `grid_w`/`grid_h`
+/// are the grid's outer size in px.
+pub fn v_scrollbar(
+    pane: &PaneGeometry,
+    total_h: f64,
+    grid_w: f32,
+    grid_h: f32,
+) -> Option<ScrollBar> {
+    let thumb = pane.v_thumb(total_h)?;
+    let track_start = COL_HEADER_H + pane.frozen_h as f32;
+    let track_len = (grid_h - track_start).max(0.0);
+    if track_len <= 0.0 {
+        return None;
+    }
+    Some(ScrollBar {
+        track_start,
+        track_len,
+        // Hugs the right edge: [grid_w - HIT_W, grid_w).
+        band_start: (grid_w - SCROLLBAR_HIT_W).max(0.0),
+        band_len: SCROLLBAR_HIT_W,
+        thumb,
+    })
+}
+
+/// The horizontal scrollbar for `pane`, or `None` when the non-frozen columns fit.
+pub fn h_scrollbar(
+    pane: &PaneGeometry,
+    total_w: f64,
+    grid_w: f32,
+    grid_h: f32,
+) -> Option<ScrollBar> {
+    let thumb = pane.h_thumb(total_w)?;
+    let track_start = pane.row_header_w + pane.frozen_w as f32;
+    let track_len = (grid_w - track_start).max(0.0);
+    if track_len <= 0.0 {
+        return None;
+    }
+    Some(ScrollBar {
+        track_start,
+        track_len,
+        // Hugs the bottom edge: [grid_h - HIT_W, grid_h).
+        band_start: (grid_h - SCROLLBAR_HIT_W).max(0.0),
+        band_len: SCROLLBAR_HIT_W,
+        thumb,
+    })
+}
+
+/// Whether a grid-local point falls in `bar`'s pointer band. `Vertical` bands are tested on x and
+/// their track on y; `Horizontal` the other way round.
+pub fn scrollbar_contains(axis: ScrollAxis, bar: &ScrollBar, local_x: f32, local_y: f32) -> bool {
+    let (along, cross) = match axis {
+        ScrollAxis::Vertical => (local_y, local_x),
+        ScrollAxis::Horizontal => (local_x, local_y),
+    };
+    along >= bar.track_start
+        && along <= bar.track_start + bar.track_len
+        && cross >= bar.band_start
+        && cross <= bar.band_start + bar.band_len
+}
+
+/// Inverts [`scrollbar_thumb`]: the scroll offset (px) implied by placing the thumb's start at
+/// `thumb_offset` along the track. Clamped to the scrollable range.
+pub fn scroll_from_thumb(total: f64, content: f64, thumb_offset: f32, track_len: f32) -> f64 {
+    let max = max_scroll(total, content);
+    if max <= 0.0 || track_len <= 0.0 {
+        return 0.0;
+    }
+    // The thumb's length at this scale is independent of the offset, so 0.0 reads it out cleanly.
+    let thumb_len = scrollbar_thumb(total, content, 0.0, track_len)
+        .map(|t| t.length)
+        .unwrap_or(track_len);
+    let travel = (track_len - thumb_len).max(f32::EPSILON);
+    let fraction = (thumb_offset / travel).clamp(0.0, 1.0) as f64;
+    fraction * max
 }
 
 /// Hit-tests a **grid-local** pixel (origin at the grid's top-left) to a [`GridHit`].
@@ -1398,5 +1505,108 @@ mod tests {
         assert_eq!(estimated_text_width("", 13.0), 0.0);
         assert!(estimated_text_width("aaaa", 26.0) > estimated_text_width("aaaa", 13.0));
         assert!(estimated_text_width("aaaaaaaa", 13.0) > estimated_text_width("aaaa", 13.0));
+    }
+
+    /// A pane whose body is `body_h` tall and `body_w` wide, unfrozen at scroll `(sx, sy)`.
+    fn pane(body_w: f64, body_h: f64, sx: f64, sy: f64) -> PaneGeometry {
+        PaneGeometry {
+            row_header_w: ROW_HEADER_MIN_W,
+            frozen_w: 0.0,
+            frozen_h: 0.0,
+            content_w: body_w,
+            content_h: body_h,
+            body_sx: sx,
+            body_sy: sy,
+        }
+    }
+
+    #[test]
+    fn v_scrollbar_band_hugs_right_edge() {
+        // 1000 px of rows in a 400 px body → a thumb exists, and its band ends at the grid's edge.
+        let p = pane(400.0, 400.0, 0.0, 0.0);
+        let bar = v_scrollbar(&p, 1000.0, 500.0, 460.0).expect("rows overflow ⇒ bar");
+        assert_eq!(bar.band_start, 500.0 - SCROLLBAR_HIT_W);
+        assert_eq!(bar.band_len, SCROLLBAR_HIT_W);
+        // Track starts below the column-header strip and runs to the grid's bottom.
+        assert_eq!(bar.track_start, COL_HEADER_H);
+        assert_eq!(bar.track_len, 460.0 - COL_HEADER_H);
+    }
+
+    #[test]
+    fn v_scrollbar_absent_when_rows_fit() {
+        let p = pane(400.0, 400.0, 0.0, 0.0);
+        assert!(v_scrollbar(&p, 300.0, 500.0, 460.0).is_none());
+    }
+
+    #[test]
+    fn scrollbar_contains_respects_band_and_track() {
+        let p = pane(400.0, 400.0, 0.0, 0.0);
+        let bar = v_scrollbar(&p, 1000.0, 500.0, 460.0).unwrap();
+        // Inside the right-edge band, below the column header.
+        assert!(scrollbar_contains(ScrollAxis::Vertical, &bar, 495.0, 200.0));
+        // Same y, but left of the band → a normal grid click.
+        assert!(!scrollbar_contains(
+            ScrollAxis::Vertical,
+            &bar,
+            300.0,
+            200.0
+        ));
+        // In the band but above the track (over the column headers) → not the scrollbar.
+        assert!(!scrollbar_contains(
+            ScrollAxis::Vertical,
+            &bar,
+            495.0,
+            COL_HEADER_H - 2.0
+        ));
+    }
+
+    #[test]
+    fn h_scrollbar_band_hugs_bottom_edge() {
+        let p = pane(400.0, 400.0, 0.0, 0.0);
+        let bar = h_scrollbar(&p, 1000.0, 500.0, 460.0).expect("cols overflow ⇒ bar");
+        assert_eq!(bar.band_start, 460.0 - SCROLLBAR_HIT_W);
+        assert_eq!(bar.track_start, ROW_HEADER_MIN_W);
+        assert!(scrollbar_contains(
+            ScrollAxis::Horizontal,
+            &bar,
+            200.0,
+            455.0
+        ));
+        assert!(!scrollbar_contains(
+            ScrollAxis::Horizontal,
+            &bar,
+            200.0,
+            300.0
+        ));
+    }
+
+    #[test]
+    fn scroll_from_thumb_inverts_the_thumb_placement() {
+        // Half the content visible over a 400 px track: the thumb is 200 px long, so it can travel
+        // 200 px. Dragging it through that whole travel maps to the first and last scroll offsets.
+        let total = 1000.0;
+        let content = 500.0;
+        let track = 400.0;
+        let max = max_scroll(total, content);
+        let thumb_len = scrollbar_thumb(total, content, 0.0, track).unwrap().length;
+        let travel = track - thumb_len;
+        assert_eq!(thumb_len, 200.0);
+        assert_eq!(travel, 200.0);
+
+        assert_eq!(scroll_from_thumb(total, content, 0.0, track), 0.0);
+        assert!((scroll_from_thumb(total, content, travel / 2.0, track) - max / 2.0).abs() < 1e-6);
+        assert!((scroll_from_thumb(total, content, travel, track) - max).abs() < 1e-6);
+        // Past the end clamps rather than overshooting.
+        assert!((scroll_from_thumb(total, content, 1000.0, track) - max).abs() < 1e-6);
+        // Round-trip: the thumb offset a given scroll produces maps back to that scroll.
+        let thumb = scrollbar_thumb(total, content, max * 0.25, track).unwrap();
+        let back = scroll_from_thumb(total, content, thumb.offset, track);
+        assert!((back - max * 0.25).abs() < 1e-3, "round-trip: {back}");
+    }
+
+    #[test]
+    fn scroll_from_thumb_is_zero_when_nothing_scrolls() {
+        assert_eq!(scroll_from_thumb(300.0, 400.0, 100.0, 380.0), 0.0);
+        assert_eq!(scroll_from_thumb(1000.0, 400.0, 100.0, 0.0), 0.0);
     }
 }

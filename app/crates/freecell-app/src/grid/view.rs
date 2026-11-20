@@ -44,7 +44,8 @@ use crate::chrome::AutocompleteDisplay;
 use super::chart_layer::{self, ChartPlacement, ChartRect, Handle, HANDLE_HIT_HALF, HANDLE_PX};
 use super::input::{command_for_key, GridKeyCommand};
 use super::layout::{
-    self, ContentArea, GridHit, COL_HEADER_H, RENDER_OVERSCAN, SCROLLBAR_INSET, SCROLLBAR_THICKNESS,
+    self, ContentArea, GridHit, ScrollAxis, COL_HEADER_H, RENDER_OVERSCAN, SCROLLBAR_INSET,
+    SCROLLBAR_THICKNESS,
 };
 use super::{
     GridEvent, GridEventSink, RowOrCol, ACCENT, AUTOSCROLL_INTERVAL_MS, CELL_BG, CELL_FONT_PX,
@@ -119,6 +120,17 @@ enum DragMode {
 struct DragState {
     anchor: CellRef,
     mode: DragMode,
+}
+
+/// An in-flight scrollbar thumb drag. `grab` is where along the thumb the pointer took hold (px
+/// from the thumb's start), so the thumb does not jump under the cursor; `track_len` is the track
+/// the drag started on, which stays fixed for the whole gesture even if the viewport repaints.
+#[derive(Debug, Clone, Copy)]
+struct ScrollbarDrag {
+    axis: ScrollAxis,
+    grab: f32,
+    track_start: f32,
+    track_len: f32,
 }
 
 /// The open insert/delete + hide/unhide header context menu (`functional_spec.md §5.3`).
@@ -282,8 +294,14 @@ pub struct GridView {
     selection: HashMap<SheetId, SelectionModel>,
     /// `Some("name")` renders the file-open loading overlay.
     loading: Option<String>,
-    /// Whether the overlay scrollbars are currently shown (set on scroll, faded after 2 s).
+    /// Whether the overlay scrollbars are currently shown (set on scroll, faded after 2 s, and
+    /// held visible while the pointer rests on their band or a thumb drag is in flight).
     scrollbars_visible: bool,
+    /// Which scrollbar band the pointer is currently over, if any. Hovering a band reveals that bar
+    /// (`components/grid.md §Scrollbars`) and holding it there cancels the fade.
+    scrollbar_hover: Option<ScrollAxis>,
+    /// The in-flight scrollbar thumb drag, if any (`None` = not dragging a bar).
+    scrollbar_drag: Option<ScrollbarDrag>,
     /// Render-test / debug override: keep the scrollbars visible regardless of activity.
     force_scrollbars: bool,
     /// Render-test / debug override: freeze the loading spinner to a static icon (no
@@ -756,6 +774,8 @@ impl GridView {
             selection,
             loading: None,
             scrollbars_visible: false,
+            scrollbar_hover: None,
+            scrollbar_drag: None,
             force_scrollbars: false,
             freeze_spinner: false,
             scroll_activity: 0,
@@ -1575,7 +1595,11 @@ impl GridView {
                 .timer(Duration::from_secs(SCROLLBAR_FADE_SECS))
                 .await;
             this.update(cx, |this, cx| {
-                if this.scroll_activity == epoch && !this.force_scrollbars {
+                if this.scroll_activity == epoch
+                    && !this.force_scrollbars
+                    && this.scrollbar_hover.is_none()
+                    && this.scrollbar_drag.is_none()
+                {
                     this.scrollbars_visible = false;
                     cx.notify();
                 }
@@ -1583,6 +1607,195 @@ impl GridView {
             .ok();
         })
         .detach();
+    }
+
+    /// The vertical and horizontal scrollbars for the current frame, in grid-local px. `None` on
+    /// an axis whose content fits (nothing to scroll, so nothing to drag).
+    fn scrollbars_at(&self, viewport_w: f64, viewport_h: f64) -> (Option<layout::ScrollBar>, Option<layout::ScrollBar>) {
+        let active = self.active_sheet;
+        let caches = self.sources.caches.read();
+        let Some(cache) = caches.get(active) else {
+            return (None, None);
+        };
+        let (sx, sy) = self.scroll_of(active);
+        let pane =
+            Self::input_pane_geometry(cache, viewport_w, viewport_h, sx, sy);
+        let grid_w = viewport_w as f32;
+        let grid_h = viewport_h as f32;
+        (
+            layout::v_scrollbar(&pane, cache.total_height(), grid_w, grid_h),
+            layout::h_scrollbar(&pane, cache.total_width(), grid_w, grid_h),
+        )
+    }
+
+    /// Which scrollbar band (if any) a grid-local point falls in. The vertical bar wins the
+    /// bottom-right corner, matching where its band is drawn.
+    fn scrollbar_at(&self, local_x: f32, local_y: f32, viewport_w: f64, viewport_h: f64) -> Option<ScrollAxis> {
+        let (v, h) = self.scrollbars_at(viewport_w, viewport_h);
+        if let Some(bar) = v {
+            if layout::scrollbar_contains(ScrollAxis::Vertical, &bar, local_x, local_y) {
+                return Some(ScrollAxis::Vertical);
+            }
+        }
+        if let Some(bar) = h {
+            if layout::scrollbar_contains(ScrollAxis::Horizontal, &bar, local_x, local_y) {
+                return Some(ScrollAxis::Horizontal);
+            }
+        }
+        None
+    }
+
+    /// Scrolls to an absolute body offset on one axis (px), clamped by the pane geometry, and
+    /// refreshes the scrollbar / viewport announcements exactly like a wheel scroll.
+    fn set_body_scroll(
+        &mut self,
+        axis: ScrollAxis,
+        value: f64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
+        let active = self.active_sheet;
+        let resolved = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(active) else {
+                return;
+            };
+            let (row_axis, col_axis) = cache.axes();
+            let (sx0, sy0) = self.scroll_of(active);
+            let (frozen_h, frozen_w) = (cache.frozen_rows(), cache.frozen_cols());
+            let row_frozen_h = row_axis.offset_of(frozen_h.min(row_axis.count()));
+            let col_frozen_w = col_axis.offset_of(frozen_w.min(col_axis.count()));
+            let body_h = (viewport_h - row_frozen_h).max(0.0);
+            let rows = row_axis.visible_range(row_frozen_h + sy0, body_h, RENDER_OVERSCAN);
+            let row_header_w = layout::row_header_width(rows.end.max(frozen_h).saturating_sub(1));
+            let content_w = (viewport_w - row_header_w as f64).max(0.0);
+            let pane = layout::PaneGeometry {
+                row_header_w,
+                frozen_w: col_frozen_w,
+                frozen_h: row_frozen_h,
+                content_w,
+                content_h: viewport_h,
+                body_sx: sx0,
+                body_sy: sy0,
+            };
+            let (body_w, _) = pane.body_area();
+            let (mut nx, mut ny) = (sx0, sy0);
+            match axis {
+                ScrollAxis::Vertical => ny = value,
+                ScrollAxis::Horizontal => nx = value,
+            }
+            let pane = layout::PaneGeometry { body_sx: nx, body_sy: ny, ..pane };
+            let (nx, ny) = pane.clamp(cache.total_width(), cache.total_height());
+            let rows = row_axis.visible_range(row_frozen_h + ny, body_h, RENDER_OVERSCAN);
+            let cols = col_axis.visible_range(col_frozen_w + nx, body_w, RENDER_OVERSCAN);
+            (nx, ny, rows, cols)
+        };
+        let (nx, ny, rows, cols) = resolved;
+        self.scroll.insert(active, (nx, ny));
+        self.mark_scrollbars_active(cx);
+        let changed = self.last_viewport.as_ref() != Some(&(rows.clone(), cols.clone()));
+        if changed {
+            self.last_viewport = Some((rows.clone(), cols.clone()));
+            self.events
+                .emit(&GridEvent::ViewportChanged { rows, cols }, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Mouse-down on a scrollbar band: grab the thumb, or — when the press lands on the track
+    /// beside the thumb — jump the thumb to the pointer and continue dragging it. Returns whether
+    /// the press was consumed by a bar.
+    fn begin_scrollbar_drag(
+        &mut self,
+        local_x: f32,
+        local_y: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
+        let Some(axis) = self.scrollbar_at(local_x, local_y, viewport_w, viewport_h) else {
+            return false;
+        };
+        let (v, h) = self.scrollbars_at(viewport_w, viewport_h);
+        let bar = match axis {
+            ScrollAxis::Vertical => v,
+            ScrollAxis::Horizontal => h,
+        };
+        let Some(bar) = bar else {
+            return false;
+        };
+
+        let along = match axis {
+            ScrollAxis::Vertical => local_y,
+            ScrollAxis::Horizontal => local_x,
+        };
+        // Position of the pointer relative to the thumb. Inside the thumb it is kept as the grab
+        // point (no jump); outside it, the thumb centres on the pointer.
+        let offset = along - bar.track_start;
+        let grab = if offset >= bar.thumb.offset && offset <= bar.thumb.offset + bar.thumb.length {
+            offset - bar.thumb.offset
+        } else {
+            bar.thumb.length / 2.0
+        };
+
+        self.scrollbar_drag = Some(ScrollbarDrag {
+            axis,
+            grab,
+            track_start: bar.track_start,
+            track_len: bar.track_len,
+        });
+        self.scrollbar_hover = Some(axis);
+        self.scrollbars_visible = true;
+        // Jump immediately when the press was beside the thumb, so a click on the track behaves
+        // like clicking the scrollbar in Excel.
+        self.apply_scrollbar_drag(along, window, cx);
+        true
+    }
+
+    /// Positions the thumb from a pointer position along the dragged axis and scrolls to match.
+    fn apply_scrollbar_drag(
+        &mut self,
+        along: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.scrollbar_drag else {
+            return;
+        };
+        let active = self.active_sheet;
+        let total = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(active) else {
+                return;
+            };
+            match drag.axis {
+                ScrollAxis::Vertical => cache.total_height(),
+                ScrollAxis::Horizontal => cache.total_width(),
+            }
+        };
+        let (viewport_w, viewport_h) = self.viewport_wh(window);
+        let pane = {
+            let caches = self.sources.caches.read();
+            let Some(cache) = caches.get(active) else {
+                return;
+            };
+            let (sx, sy) = self.scroll_of(active);
+            Self::input_pane_geometry(cache, viewport_w, viewport_h, sx, sy)
+        };
+        let body = match drag.axis {
+            ScrollAxis::Vertical => {
+                let (_, body_h) = pane.body_area();
+                body_h
+            }
+            ScrollAxis::Horizontal => {
+                let (body_w, _) = pane.body_area();
+                body_w
+            }
+        };
+        let thumb_offset = along - drag.track_start - drag.grab;
+        let scroll = layout::scroll_from_thumb(total, body, thumb_offset, drag.track_len);
+        self.set_body_scroll(drag.axis, scroll, window, cx);
     }
 
     // ---- Input plumbing (Phase 8) ---------------------------------------------------------
@@ -1717,6 +1930,14 @@ impl GridView {
         // closes an open chart context menu.
         self.resize_preview = None;
         self.chart_menu = None;
+
+        // A press on a scrollbar's band grabs the thumb (or jumps the thumb to the click) instead
+        // of selecting a cell. This runs before the grid hit-test so a click in the right/bottom
+        // 14 px never lands on a cell hidden underneath.
+        let (local_x, local_y) = self.event_local(event.position);
+        if self.begin_scrollbar_drag(local_x, local_y, window, cx) {
+            return;
+        }
 
         // Focus the grid so arrow keys route here (the window arranges focus after commits).
         let handle = self.focus_handle.clone();
@@ -2047,6 +2268,31 @@ impl GridView {
         cx: &mut Context<Self>,
     ) {
         let (local_x, local_y) = self.event_local(event.position);
+        // A live scrollbar drag owns the pointer: every move repositions the thumb.
+        if self.scrollbar_drag.is_some() {
+            let along = match self.scrollbar_drag.map(|d| d.axis) {
+                Some(ScrollAxis::Horizontal) => local_x,
+                _ => local_y,
+            };
+            self.apply_scrollbar_drag(along, window, cx);
+            return;
+        }
+        // Hovering a scrollbar band reveals the bar and holds it there (cancelling the fade).
+        {
+            let (vw, vh) = self.viewport_wh(window);
+            let hovered = self.scrollbar_at(local_x, local_y, vw, vh);
+            if hovered != self.scrollbar_hover {
+                self.scrollbar_hover = hovered;
+                if hovered.is_some() {
+                    self.scrollbars_visible = true;
+                } else if self.scrollbars_visible {
+                    // Leaving the band restarts the fade rather than hiding instantly, so a quick
+                    // pass across the bar doesn't flicker.
+                    self.mark_scrollbars_active(cx);
+                }
+                cx.notify();
+            }
+        }
         // A live chart move/resize takes precedence — its delta is measured from the grab point in
         // grid-local px (== content px; the constant header offset cancels), so it needs no lock.
         if let Some(drag) = self.chart_drag.as_mut() {
@@ -2111,6 +2357,12 @@ impl GridView {
     ) {
         if let Some(drag) = self.chart_drag.take() {
             self.commit_chart_drag(drag, window, cx);
+            return;
+        }
+        // Releasing a scrollbar thumb ends the drag; the bar fades on its usual timer afterwards.
+        if self.scrollbar_drag.take().is_some() {
+            self.mark_scrollbars_active(cx);
+            cx.notify();
             return;
         }
         if let Some(rd) = self.resize_drag.take() {
@@ -4229,7 +4481,7 @@ impl GridView {
         // The thumbs represent the SCROLLING region only: their extent is the non-frozen tracks
         // against the body sub-rect, and they are drawn along the body sub-rect (offset past the
         // frozen band). `M=K=0` → the full content rect + extent (byte-for-byte today).
-        if self.scrollbars_visible || self.force_scrollbars {
+        if self.scrollbars_visible || self.force_scrollbars || self.scrollbar_hover.is_some() {
             let pane = frame.pane_geometry();
             if let Some(thumb) = pane.v_thumb(frame.total_h) {
                 let x = frame.row_header_w + frame.content_w as f32

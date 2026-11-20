@@ -52,8 +52,10 @@ pub const HEADER_SELECTED_BG: u32 = 0xE4E4E4;
 pub const ACCENT: u32 = 0x2563EB;
 /// Range-fill overlay opacity (accent at ~10%).
 pub const SELECTION_FILL_ALPHA: f32 = 0.10;
-/// Overlay-scrollbar thumb colour (semi-transparent grey).
-pub const SCROLLBAR_RGBA: u32 = 0x8A8A8A99;
+/// Overlay-scrollbar thumb colour (semi-transparent grey). Opacity is high enough that the thumb
+/// still reads as a solid grey on white cells — at 0x99 (60%) it washes out to #E2E2E2, which is
+/// effectively invisible on a light sheet.
+pub const SCROLLBAR_RGBA: u32 = 0x7A7A7AD9;
 /// Freeze-pane divider line colour (`#9E9E9E`) — a heavier mid-grey than [`GRIDLINE`], so the
 /// pinned bands read as pinned (`freeze-panes/components/viewport_split.md §4`). Drawn at the
 /// bottom edge of the frozen-rows band and/or the right edge of the frozen-columns band.
