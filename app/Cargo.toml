@@ -42,7 +42,9 @@ freecell-engine = { path = "crates/freecell-engine" }
 # the perf harness (Phase 12) depend on it to render the real grid over fixtures.
 freecell-app = { path = "crates/freecell-app" }
 
-# Engine (exact pin — the number all experiment results are comparable against)
+# Engine (exact pin — the number all experiment results are comparable against). Keep this in
+# step with the version inside the patched fork below: a mismatch makes cargo silently ignore
+# `[patch.crates-io]` and link the crates.io release instead.
 ironcalc = "=0.7.1"
 ironcalc_base = "=0.7.1"
 
@@ -108,8 +110,8 @@ opt-level = 3
 # revert to a released crates.io pin once the fixes ship (projects/ironcalc-upgrade.md).
 # ---------------------------------------------------------------------------------
 [patch.crates-io]
-ironcalc = { git = "https://github.com/scosman/ironcalc", branch = "freecell-fixes" }
-ironcalc_base = { git = "https://github.com/scosman/ironcalc", branch = "freecell-fixes" }
+ironcalc = { git = "https://github.com/yanghuiwei/IronCalc", branch = "fix/npoi-optional-styles" }
+ironcalc_base = { git = "https://github.com/yanghuiwei/IronCalc", branch = "fix/npoi-optional-styles" }
 
 # ---------------------------------------------------------------------------------
 # GPL ship blocker (zed#55470). gpui pulls `sum_tree` -> `ztracing` -> `zlog` +
